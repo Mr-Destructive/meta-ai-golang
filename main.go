@@ -1,4 +1,4 @@
-package main
+package meta_ai
 
 import (
 	"bytes"
@@ -44,6 +44,29 @@ type Payload struct {
 	IcebreakerType             string                 `json:"icebreaker_type"`
 	RelayInternalAbraDebug     bool                   `json:"__relay_internal__pv__AbraDebugDevOnlyrelayprovider"`
 	RelayInternalWebPixelRatio int                    `json:"__relay_internal__pv__WebPixelRatiorelayprovider"`
+}
+
+type MetaAIResponse struct {
+	Data struct {
+		Node struct {
+			BotResponseMessage struct {
+				ComposedText struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"composed_text"`
+				ID             string `json:"id"`
+				StreamingState string `json:"streaming_state"`
+			} `json:"bot_response_message"`
+		} `json:"node"`
+	} `json:"data"`
+}
+
+type SearchResults struct {
+	References []struct {
+		Source string `json:"source"`
+		Link   string `json:"link"`
+	} `json:"references"`
 }
 
 func NewMetaAI(fbEmail, fbPassword string, proxy map[string]string) (*MetaAI, error) {
@@ -235,7 +258,7 @@ func (m *MetaAI) prompt(message string, stream bool, attempts int, newConversati
 		return m.retry(message, stream, attempts)
 	}
 
-	extractedData, err := m.extractData(lastStreamedResponse)
+	extractedData, err := m.extractData(*lastStreamedResponse)
 	if err != nil {
 		return m.retry(message, stream, attempts)
 	}
@@ -251,64 +274,59 @@ func (m *MetaAI) retry(message string, stream bool, attempts int) (interface{}, 
 	return nil, fmt.Errorf("unable to obtain a valid response from Meta AI. try again later")
 }
 
-func (m *MetaAI) extractLastResponse(response string) (map[string]interface{}, error) {
-	var lastStreamedResponse map[string]interface{}
-	var lastResp string
+func (m *MetaAI) extractLastResponse(response string) (*MetaAIResponse, error) {
 	lastResponse := strings.Split(response, "\n")
-	if len(lastResponse) > 0 {
-		lastResp = lastResponse[len(lastResponse)-1]
-	}
-	line := lastResp
-	var jsonLine map[string]interface{}
-	if err := json.Unmarshal([]byte(line), &jsonLine); err != nil {
-		return nil, err
+	if len(lastResponse) == 0 {
+		return nil, fmt.Errorf("empty response")
 	}
 
-	botResponseMessage, ok := jsonLine["data"].(map[string]interface{})["node"].(map[string]interface{})["bot_response_message"].(map[string]interface{})
+	var lastStreamedResponse MetaAIResponse
+	err := json.Unmarshal([]byte(lastResponse[len(lastResponse)-1]), &lastStreamedResponse)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
 
-	chatID, ok := botResponseMessage["id"].(string)
-	if ok {
-		parts := strings.Split(chatID, "_")
+	if lastStreamedResponse.Data.Node.BotResponseMessage.StreamingState != "OVERALL_DONE" {
+		return nil, fmt.Errorf("streaming state not completed")
+	}
+
+	chatID := lastStreamedResponse.Data.Node.BotResponseMessage.ID
+	parts := strings.Split(chatID, "_")
+	if len(parts) == 2 {
 		m.externalConversationID = parts[0]
 		m.offlineThreadingID = parts[1]
 	}
 
-	streamingState, ok := botResponseMessage["streaming_state"].(string)
-	if ok && streamingState == "OVERALL_DONE" {
-		lastStreamedResponse = jsonLine
-	}
-	if lastStreamedResponse == nil {
-		return nil, fmt.Errorf("no valid last streamed response found")
-	}
-	return lastStreamedResponse, nil
+	return &lastStreamedResponse, nil
 }
 
-func (m *MetaAI) extractData(jsonLine map[string]interface{}) (map[string]interface{}, error) {
-	if jsonLine["data"] == nil || jsonLine["data"].(map[string]interface{})["node"] == nil {
-		return nil, fmt.Errorf("invalid JSON line")
-	}
-	botResponseMessage, ok := jsonLine["data"].(map[string]interface{})["node"].(map[string]interface{})["bot_response_message"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid bot response message in JSON line")
+func (m *MetaAI) extractData(jsonLine MetaAIResponse) (map[string]interface{}, error) {
+	if jsonLine.Data.Node.BotResponseMessage.ID == "" {
+		return nil, fmt.Errorf("invalid bot response message")
 	}
 
-	response := formatResponse(jsonLine)
+	response := jsonLine.Data.Node.BotResponseMessage.ComposedText.Content[0].Text
+	fmt.Println(response)
 	if response == "" {
 		return nil, fmt.Errorf("invalid response in bot response message")
 	}
-	_, ok = botResponseMessage["fetch_id"].(string)
-	if !ok {
-		return nil, fmt.Errorf("invalid fetch ID in bot response message")
+	sources, err := m.fetchSources(m.externalConversationID)
+	if len(sources) > 0 {
+		return map[string]interface{}{
+			"message": response,
+			"sources": sources,
+		}, nil
 	}
-
-	//sources, err := m.fetchSources(fetchID)
-	//if err != nil {
-	//	return nil, err
-	//}
+	if err != nil {
+		return map[string]interface{}{
+			"message": response,
+			"sources": nil,
+		}, nil
+	}
 
 	return map[string]interface{}{
 		"message": response,
-		"sources": []map[string]interface{}{},
+		"sources": sources,
 	}, nil
 }
 
@@ -340,13 +358,13 @@ func (m *MetaAI) getCookies() (map[string]string, error) {
 	return cookies, nil
 }
 
-func (m *MetaAI) fetchSources(fetchID string) ([]map[string]interface{}, error) {
+func (m *MetaAI) fetchSources(fetchID string) ([]SearchResults, error) {
 	URL := "https://graph.meta.ai/graphql?locale=user"
-	var payload url.Values
+	payload := url.Values{}
 	payload.Add("access_token", m.accessToken)
 	payload.Add("fb_api_caller_class", "RelayModern")
 	payload.Add("fb_api_req_friendly_name", "AbraSearchPluginDialogQuery")
-	payload.Add("variables", "{\"abraMessageFetchID\":\""+fetchID+"\"}")
+	payload.Add("variables", fmt.Sprintf(`{"abraMessageFetchID":"%s"}`, fetchID))
 	payload.Add("server_timestamps", "true")
 	payload.Add("doc_id", "6946734308765963")
 	req, err := http.NewRequest("POST", URL, strings.NewReader(payload.Encode()))
@@ -355,6 +373,7 @@ func (m *MetaAI) fetchSources(fetchID string) ([]map[string]interface{}, error) 
 	}
 
 	req.Header.Set("authority", "graph.meta.ai")
+	req.Header.Set("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	req.Header.Set("accept-language", "en-US,en;q=0.9,fr-FR;q=0.8,fr;q=0.7")
 	req.Header.Set("content-type", "application/x-www-form-urlencoded")
 	req.Header.Set("cookie", fmt.Sprintf("dpr=2; abra_csrf=%s; datr=%s; ps_n=1; ps_l=1", m.cookies["abra_csrf"], m.cookies["datr"]))
@@ -364,69 +383,29 @@ func (m *MetaAI) fetchSources(fetchID string) ([]map[string]interface{}, error) 
 	if err != nil {
 		return nil, err
 	}
-
 	defer resp.Body.Close()
-	var respJSON map[string]interface{}
+	fmt.Println("response status", resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	fmt.Println("response body", string(body))
+
+	var respJSON struct {
+		Data struct {
+			Message struct {
+				SearchResults SearchResults `json:"searchResults"`
+			} `json:"message"`
+		} `json:"data"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&respJSON); err != nil {
 		return nil, err
 	}
 
-	message, ok := respJSON["data"].(map[string]interface{})["message"].(map[string]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid message in response JSON")
+	searchResults := respJSON.Data.Message.SearchResults
+	fmt.Println("response body", searchResults)
+	if len(searchResults.References) == 0 {
+		return nil, fmt.Errorf("no search results found")
 	}
 
-	searchResults, ok := message["searchResults"].(map[string]interface{})
-	if !ok || searchResults == nil {
-		return nil, fmt.Errorf("no search results found in response JSON")
-	}
-
-	references, ok := searchResults["references"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid references in search results")
-	}
-
-	var sources []map[string]interface{}
-	for _, ref := range references {
-		refMap, ok := ref.(map[string]interface {
-		})
-		if !ok {
-			continue
-		}
-		sources = append(sources, map[string]interface{}{
-			"source": refMap["source"],
-			"link":   refMap["link"],
-		})
-	}
-	return sources, nil
-}
-
-func getFBSession(email, password string) (map[string]string, error) {
-	// Implement Facebook session retrieval logic here
-	return map[string]string{
-		"abra_sess": "abra_session_token",
-	}, nil
-}
-
-func formatResponse(resp map[string]interface{}) string {
-	// Implement response formatting logic here
-	if resp["data"] == nil || resp["data"].(map[string]interface{})["node"] == nil {
-		return ""
-	}
-	botResponseMessage, ok := resp["data"].(map[string]interface{})["node"].(map[string]interface{})["bot_response_message"].(map[string]interface{})
-	if !ok {
-		return ""
-	}
-	botResponseMessage, ok = botResponseMessage["composed_text"].(map[string]interface{})
-	if !ok {
-		return ""
-	}
-	content := botResponseMessage["content"].([]interface{})
-	text := content[0].(map[string]interface{})
-	if text["text"] == nil {
-		return ""
-	}
-	return text["text"].(string)
+	return []SearchResults{searchResults}, nil
 }
 
 func generateOfflineThreadingID() string {
@@ -464,7 +443,7 @@ func main() {
 		log.Fatalf("error creating MetaAI instance: %v", err)
 	}
 
-	resp, err := meta.prompt("What is the weather of Mumbai today", false, 0, false)
+	resp, err := meta.prompt("What is the weather of Mumbai today in degree celcius.", false, 0, false)
 	if err != nil {
 		log.Fatalf("error getting response: %v", err)
 	}
